@@ -6,6 +6,7 @@ import (
 	"github.com/aws/aws-cdk-go/awscdk/v2"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsecs"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awselasticloadbalancingv2"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awsiam"
 	"os"
 
 	// "github.com/aws/aws-cdk-go/awscdk/v2/awssqs"
@@ -74,55 +75,51 @@ func NewK3SCdkStack(scope constructs.Construct, id string, props *K3SCdkStackPro
 		PublicKeyMaterial: &sshPubKey,
 	})
 
+	role := awsiam.NewRole(stack, jsii.String("k3s-role"), &awsiam.RoleProps{
+		AssumedBy:       awsiam.NewServicePrincipal(jsii.String("ec2.amazonaws.com"), nil),
+		ManagedPolicies: &[]awsiam.IManagedPolicy{awsiam.ManagedPolicy_FromAwsManagedPolicyName(jsii.String("AmazonSSMManagedInstanceCore"))},
+	})
+
 	k3sControlPlaneUserData = fmt.Sprintf(k3sControlPlaneUserData, os.Getenv("K3S_TOKEN"))
 	controlPlane := makeInstance(
 		stack,
 		"k3s-control-plane-01",
 		vpc,
+		role,
 		sgControlPlane,
 		k3sControlPlaneUserData,
 		keyPair,
 	)
 
-	tg := awselasticloadbalancingv2.NewNetworkTargetGroup(
-		stack,
-		jsii.String("k3s-control-plane-01-tg"),
-		&awselasticloadbalancingv2.NetworkTargetGroupProps{
-			TargetGroupName: jsii.String("k3s-control-plane-01-tg"),
-			Vpc:             vpc,
-			Port:            jsii.Number(80),
-			Protocol:        awselasticloadbalancingv2.Protocol_TCP,
-			Targets: &[]awselasticloadbalancingv2.INetworkLoadBalancerTarget{
-				awselasticloadbalancingv2targets.NewInstanceIdTarget(
-					controlPlane.InstanceId(),
-					jsii.Number(80),
-				),
-			},
-		},
-	)
-
-	elb := awselasticloadbalancingv2.NewNetworkLoadBalancer(
+	elb := awselasticloadbalancingv2.NewApplicationLoadBalancer(
 		stack,
 		jsii.String("k3s-control-plane-lb"),
-		&awselasticloadbalancingv2.NetworkLoadBalancerProps{
+		&awselasticloadbalancingv2.ApplicationLoadBalancerProps{
 			Vpc:              vpc,
 			InternetFacing:   jsii.Bool(true),
 			LoadBalancerName: jsii.String("k3s-control-plane-lb"),
+			SecurityGroup:    sgControlPlane,
 		},
 	)
 
 	listener := elb.AddListener(
 		jsii.String("k3s-control-plane-lb-listener"),
-		&awselasticloadbalancingv2.BaseNetworkListenerProps{
+		&awselasticloadbalancingv2.BaseApplicationListenerProps{
 			Port: jsii.Number(80),
 		},
 	)
 
 	listener.AddTargets(
 		jsii.String("k3s-control-plane-lb-listener-targets"),
-		&awselasticloadbalancingv2.AddNetworkTargetsProps{
+		&awselasticloadbalancingv2.AddApplicationTargetsProps{
 			Port:            jsii.Number(80),
-			TargetGroupName: tg.TargetGroupName(),
+			TargetGroupName: jsii.String("k3s-control-plane-01-tg"),
+			Targets: &[]awselasticloadbalancingv2.IApplicationLoadBalancerTarget{
+				awselasticloadbalancingv2targets.NewInstanceIdTarget(
+					controlPlane.InstanceId(),
+					jsii.Number(80),
+				),
+			},
 		},
 	)
 
@@ -152,8 +149,8 @@ func NewK3SCdkStack(scope constructs.Construct, id string, props *K3SCdkStackPro
 	)
 
 	k3sAgentUserData = fmt.Sprintf(k3sAgentUserData, os.Getenv("K3S_TOKEN"), *controlPlane.InstancePrivateIp())
-	makeInstance(stack, "k3s-agent-01", vpc, sgAgents, k3sAgentUserData, keyPair)
-	makeInstance(stack, "k3s-agent-02", vpc, sgAgents, k3sAgentUserData, keyPair)
+	makeInstance(stack, "k3s-agent-01", vpc, nil, sgAgents, k3sAgentUserData, keyPair)
+	makeInstance(stack, "k3s-agent-02", vpc, nil, sgAgents, k3sAgentUserData, keyPair)
 
 	sgControlPlane.AddIngressRule(
 		awsec2.Peer_SecurityGroupId(sgAgents.SecurityGroupId(), nil),
@@ -167,14 +164,7 @@ func NewK3SCdkStack(scope constructs.Construct, id string, props *K3SCdkStackPro
 	return stack
 }
 
-func makeInstance(
-	stack awscdk.Stack,
-	instanceName string,
-	vpc awsec2.Vpc,
-	sgControlPlane awsec2.SecurityGroup,
-	userData string,
-	keyPair awsec2.CfnKeyPair,
-) awsec2.Instance {
+func makeInstance(stack awscdk.Stack, instanceName string, vpc awsec2.Vpc, role awsiam.Role, sgControlPlane awsec2.SecurityGroup, userData string, keyPair awsec2.CfnKeyPair) awsec2.Instance {
 	return awsec2.NewInstance(stack, jsii.String(instanceName), &awsec2.InstanceProps{
 		InstanceType: awsec2.NewInstanceType(jsii.String("t3a.micro")),
 		MachineImage: awsecs.EcsOptimizedImage_AmazonLinux2(
@@ -182,6 +172,7 @@ func makeInstance(
 			&awsecs.EcsOptimizedImageOptions{},
 		),
 		Vpc:                       vpc,
+		Role:                      role,
 		SecurityGroup:             sgControlPlane,
 		AllowAllOutbound:          jsii.Bool(true),
 		DetailedMonitoring:        jsii.Bool(true),
