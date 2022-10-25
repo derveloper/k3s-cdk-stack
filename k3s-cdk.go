@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"github.com/aws/aws-cdk-go/awscdk/v2"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsecs"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awselasticloadbalancingv2"
 	"os"
 
 	// "github.com/aws/aws-cdk-go/awscdk/v2/awssqs"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsec2"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awselasticloadbalancingv2targets"
 	"github.com/aws/constructs-go/constructs/v10"
 	"github.com/aws/jsii-runtime-go"
 )
@@ -38,11 +40,15 @@ func NewK3SCdkStack(scope constructs.Construct, id string, props *K3SCdkStackPro
 		Cidr:        jsii.String("10.0.3.0/24"),
 	})
 
-	sgControlPlane := awsec2.NewSecurityGroup(stack, jsii.String("k3s-security-group-cp"), &awsec2.SecurityGroupProps{
-		Vpc:              vpc,
-		AllowAllOutbound: jsii.Bool(true),
-		Description:      jsii.String("K3S Security Group for Control Plane"),
-	})
+	sgControlPlane := awsec2.NewSecurityGroup(
+		stack,
+		jsii.String("k3s-security-group-cp"),
+		&awsec2.SecurityGroupProps{
+			Vpc:              vpc,
+			AllowAllOutbound: jsii.Bool(true),
+			Description:      jsii.String("K3S Security Group for Control Plane"),
+		},
+	)
 	sgControlPlane.AddIngressRule(
 		awsec2.Peer_AnyIpv4(),
 		awsec2.Port_Tcp(jsii.Number(80)),
@@ -69,42 +75,75 @@ func NewK3SCdkStack(scope constructs.Construct, id string, props *K3SCdkStackPro
 	})
 
 	k3sControlPlaneUserData = fmt.Sprintf(k3sControlPlaneUserData, os.Getenv("K3S_TOKEN"))
-	controlPlane := awsec2.NewInstance(stack, jsii.String("k3s-control-plane-01"), &awsec2.InstanceProps{
-		InstanceType:              awsec2.NewInstanceType(jsii.String("t3a.micro")),
-		MachineImage:              awsecs.EcsOptimizedImage_AmazonLinux2(awsecs.AmiHardwareType_STANDARD, &awsecs.EcsOptimizedImageOptions{}),
-		Vpc:                       vpc,
-		SecurityGroup:             sgControlPlane,
-		AllowAllOutbound:          jsii.Bool(true),
-		DetailedMonitoring:        jsii.Bool(true),
-		InstanceName:              jsii.String("k3s-control-plane"),
-		UserData:                  awsec2.MultipartUserData_Custom(&k3sControlPlaneUserData),
-		UserDataCausesReplacement: jsii.Bool(true),
-		KeyName:                   keyPair.KeyName(),
-		VpcSubnets: &awsec2.SubnetSelection{
-			SubnetType: awsec2.SubnetType_PUBLIC,
+	controlPlane := makeInstance(
+		stack,
+		"k3s-control-plane-01",
+		vpc,
+		sgControlPlane,
+		k3sControlPlaneUserData,
+		keyPair,
+	)
+
+	tg := awselasticloadbalancingv2.NewNetworkTargetGroup(
+		stack,
+		jsii.String("k3s-control-plane-01-tg"),
+		&awselasticloadbalancingv2.NetworkTargetGroupProps{
+			TargetGroupName: jsii.String("k3s-control-plane-01-tg"),
+			Vpc:             vpc,
+			Port:            jsii.Number(80),
+			Protocol:        awselasticloadbalancingv2.Protocol_TCP,
+			Targets: &[]awselasticloadbalancingv2.INetworkLoadBalancerTarget{
+				awselasticloadbalancingv2targets.NewInstanceIdTarget(
+					controlPlane.InstanceId(),
+					jsii.Number(80),
+				),
+			},
 		},
-	})
+	)
 
-	ip := awsec2.NewCfnEIP(stack, jsii.String("controlPlaneElasticIp"), &awsec2.CfnEIPProps{
-		InstanceId: controlPlane.InstanceId(),
-	})
+	elb := awselasticloadbalancingv2.NewNetworkLoadBalancer(
+		stack,
+		jsii.String("k3s-control-plane-lb"),
+		&awselasticloadbalancingv2.NetworkLoadBalancerProps{
+			Vpc:              vpc,
+			InternetFacing:   jsii.Bool(true),
+			LoadBalancerName: jsii.String("k3s-control-plane-lb"),
+		},
+	)
 
-	controlPlane.AddUserData()
+	listener := elb.AddListener(
+		jsii.String("k3s-control-plane-lb-listener"),
+		&awselasticloadbalancingv2.BaseNetworkListenerProps{
+			Port: jsii.Number(80),
+		},
+	)
+
+	listener.AddTargets(
+		jsii.String("k3s-control-plane-lb-listener-targets"),
+		&awselasticloadbalancingv2.AddNetworkTargetsProps{
+			Port:            jsii.Number(80),
+			TargetGroupName: tg.TargetGroupName(),
+		},
+	)
 
 	awscdk.NewCfnOutput(stack, jsii.String("controlPlaneInstanceId"), &awscdk.CfnOutputProps{
 		Value:      controlPlane.InstanceId(),
 		ExportName: jsii.String("controlPlaneInstanceId"),
 	})
-	awscdk.NewCfnOutput(stack, jsii.String("controlPlanePublicIp"), &awscdk.CfnOutputProps{
-		Value:      ip.Ref(),
-		ExportName: jsii.String("controlPlanePublicIp"),
+	awscdk.NewCfnOutput(stack, jsii.String("sgControlPlaneId"), &awscdk.CfnOutputProps{
+		Value:      sgControlPlane.SecurityGroupId(),
+		ExportName: jsii.String("sgControlPlaneId"),
 	})
 
-	sgAgents := awsec2.NewSecurityGroup(stack, jsii.String("k3s-security-group-agents"), &awsec2.SecurityGroupProps{
-		Vpc:              vpc,
-		AllowAllOutbound: jsii.Bool(true),
-		Description:      jsii.String("K3S Security Group for agents"),
-	})
+	sgAgents := awsec2.NewSecurityGroup(
+		stack,
+		jsii.String("k3s-security-group-agents"),
+		&awsec2.SecurityGroupProps{
+			Vpc:              vpc,
+			AllowAllOutbound: jsii.Bool(true),
+			Description:      jsii.String("K3S Security Group for agents"),
+		},
+	)
 	sgAgents.AddIngressRule(
 		awsec2.Peer_Ipv4(vpc.VpcCidrBlock()),
 		awsec2.Port_AllTraffic(),
@@ -113,41 +152,67 @@ func NewK3SCdkStack(scope constructs.Construct, id string, props *K3SCdkStackPro
 	)
 
 	k3sAgentUserData = fmt.Sprintf(k3sAgentUserData, os.Getenv("K3S_TOKEN"), *controlPlane.InstancePrivateIp())
-
-	awsec2.NewInstance(stack, jsii.String("k3s-agent-01"), &awsec2.InstanceProps{
-		InstanceType:              awsec2.NewInstanceType(jsii.String("t3a.micro")),
-		MachineImage:              awsecs.EcsOptimizedImage_AmazonLinux2(awsecs.AmiHardwareType_STANDARD, &awsecs.EcsOptimizedImageOptions{}),
-		Vpc:                       vpc,
-		SecurityGroup:             sgAgents,
-		AllowAllOutbound:          jsii.Bool(true),
-		DetailedMonitoring:        jsii.Bool(true),
-		InstanceName:              jsii.String("k3s-agent-01"),
-		UserData:                  awsec2.MultipartUserData_Custom(&k3sAgentUserData),
-		UserDataCausesReplacement: jsii.Bool(true),
-		KeyName:                   keyPair.KeyName(),
-		VpcSubnets: &awsec2.SubnetSelection{
-			SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
-		},
-	})
-
-	awsec2.NewInstance(stack, jsii.String("k3s-agent-02"), &awsec2.InstanceProps{
-		InstanceType:              awsec2.NewInstanceType(jsii.String("t3a.micro")),
-		MachineImage:              awsecs.EcsOptimizedImage_AmazonLinux2(awsecs.AmiHardwareType_STANDARD, &awsecs.EcsOptimizedImageOptions{}),
-		Vpc:                       vpc,
-		SecurityGroup:             sgAgents,
-		AllowAllOutbound:          jsii.Bool(true),
-		DetailedMonitoring:        jsii.Bool(true),
-		InstanceName:              jsii.String("k3s-agent-02"),
-		UserData:                  awsec2.MultipartUserData_Custom(&k3sAgentUserData),
-		UserDataCausesReplacement: jsii.Bool(true),
-		KeyName:                   keyPair.KeyName(),
-		VpcSubnets: &awsec2.SubnetSelection{
-			SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
-		},
-	})
+	makeInstance(stack, "k3s-agent-01", vpc, sgAgents, k3sAgentUserData, keyPair)
+	makeInstance(stack, "k3s-agent-02", vpc, sgAgents, k3sAgentUserData, keyPair)
 
 	sgControlPlane.AddIngressRule(
 		awsec2.Peer_SecurityGroupId(sgAgents.SecurityGroupId(), nil),
+		awsec2.Port_Tcp(jsii.Number(6443)),
+		jsii.String("Allow k3s api inbound (IP v4)."),
+		jsii.Bool(false),
+	)
+
+	awscdk.Fn_ImportValue(jsii.String("controlPlanePublicIp"))
+
+	return stack
+}
+
+func makeInstance(
+	stack awscdk.Stack,
+	instanceName string,
+	vpc awsec2.Vpc,
+	sgControlPlane awsec2.SecurityGroup,
+	userData string,
+	keyPair awsec2.CfnKeyPair,
+) awsec2.Instance {
+	return awsec2.NewInstance(stack, jsii.String(instanceName), &awsec2.InstanceProps{
+		InstanceType: awsec2.NewInstanceType(jsii.String("t3a.micro")),
+		MachineImage: awsecs.EcsOptimizedImage_AmazonLinux2(
+			awsecs.AmiHardwareType_STANDARD,
+			&awsecs.EcsOptimizedImageOptions{},
+		),
+		Vpc:                       vpc,
+		SecurityGroup:             sgControlPlane,
+		AllowAllOutbound:          jsii.Bool(true),
+		DetailedMonitoring:        jsii.Bool(true),
+		InstanceName:              jsii.String(instanceName),
+		UserData:                  awsec2.MultipartUserData_Custom(&userData),
+		UserDataCausesReplacement: jsii.Bool(true),
+		KeyName:                   keyPair.KeyName(),
+		VpcSubnets: &awsec2.SubnetSelection{
+			SubnetType: awsec2.SubnetType_PRIVATE_WITH_EGRESS,
+		},
+	})
+}
+
+func NewSgRulesStack(scope constructs.Construct, id string, props *K3SCdkStackProps) awscdk.Stack {
+	var sprops awscdk.StackProps
+	if props != nil {
+		sprops = props.StackProps
+	}
+	stack := awscdk.NewStack(scope, &id, &sprops)
+
+	sgControlPlaneId := awscdk.Fn_ImportValue(jsii.String("sgControlPlaneId"))
+
+	sgControlPlane := awsec2.SecurityGroup_FromSecurityGroupId(
+		stack,
+		jsii.String("sgControlPlane"),
+		sgControlPlaneId,
+		&awsec2.SecurityGroupImportOptions{},
+	)
+
+	sgControlPlane.AddIngressRule(
+		awsec2.Peer_SecurityGroupId(sgControlPlaneId, nil),
 		awsec2.Port_Tcp(jsii.Number(6443)),
 		jsii.String("Allow k3s api inbound (IP v4)."),
 		jsii.Bool(false),
@@ -161,11 +226,19 @@ func main() {
 
 	app := awscdk.NewApp(nil)
 
-	NewK3SCdkStack(app, "K3SCdkStack", &K3SCdkStackProps{
+	baseStack := NewK3SCdkStack(app, "K3SCdkStack", &K3SCdkStackProps{
 		awscdk.StackProps{
 			Env: env(),
 		},
 	})
+
+	rulesStack := NewSgRulesStack(app, "K3SRulesStack", &K3SCdkStackProps{
+		awscdk.StackProps{
+			Env: env(),
+		},
+	})
+
+	rulesStack.AddDependency(baseStack, jsii.String("sg rules depends on base stack"))
 
 	app.Synth(nil)
 }
